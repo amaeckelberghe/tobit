@@ -4,30 +4,9 @@ import warnings
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-import scipy.stats
 from scipy.special import log_ndtr
+import scipy.stats
 from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-
-
-def split_left_right_censored(x, y, cens):
-    counts = cens.value_counts()
-    if -1 not in counts and 1 not in counts:
-        warnings.warn("No censored observations; use regression methods for uncensored data")
-    xs = []
-    ys = []
-
-    for value in [-1, 0, 1]:
-        if value in counts:
-            split = cens == value
-            y_split = np.squeeze(y[split].values)
-            x_split = x[split].values
-
-        else:
-            y_split, x_split = None, None
-        xs.append(x_split)
-        ys.append(y_split)
-    return xs, ys
 
 
 def tobit_neg_log_likelihood(xs, ys, params):
@@ -35,7 +14,6 @@ def tobit_neg_log_likelihood(xs, ys, params):
     y_left, y_mid, y_right = ys
 
     b = params[:-1]
-    # s = math.exp(params[-1])
     s = params[-1]
 
     to_cat = []
@@ -51,7 +29,7 @@ def tobit_neg_log_likelihood(xs, ys, params):
         to_cat.append(right)
     if cens:
         concat_stats = np.concatenate(to_cat, axis=0) / s
-        log_cum_norm = scipy.stats.norm.logcdf(concat_stats)  # log_ndtr(concat_stats)
+        log_cum_norm = scipy.stats.norm.logcdf(concat_stats)
         cens_sum = log_cum_norm.sum()
     else:
         cens_sum = 0
@@ -73,7 +51,6 @@ def tobit_neg_log_likelihood_der(xs, ys, params):
     y_left, y_mid, y_right = ys
 
     b = params[:-1]
-    # s = math.exp(params[-1]) # in censReg, not using chain rule as below; they optimize in terms of log(s)
     s = params[-1]
 
     beta_jac = np.zeros(len(b))
@@ -114,29 +91,35 @@ def tobit_neg_log_likelihood_der(xs, ys, params):
     return -combo_jac
 
 
-class TobitModel:
-    def __init__(self, fit_intercept=True):
+class TobitRegression:
+    def __init__(self, lower_censoring: float = None, upper_censoring: float = None, fit_intercept: bool = True):
+        if lower_censoring is None and upper_censoring is None:
+            raise ValueError("Both lower_censoring and upper_censoring are None. "
+                             "Either form of censoring is expected in tobit regressions.")
+        self.lower_censoring = lower_censoring
+        self.upper_censoring = upper_censoring
         self.fit_intercept = fit_intercept
         self.ols_coef_ = None
         self.ols_intercept = None
         self.coef_ = None
         self.intercept_ = None
         self.sigma_ = None
+        self.params = None
 
-    def fit(self, x, y, cens, verbose=False):
+    def fit(self, X, y, verbose=False):
         """
         Fit a maximum-likelihood Tobit regression
-        :param x: Pandas DataFrame (n_samples, n_features): Data
+        :param X: Pandas DataFrame (n_samples, n_features): Data
         :param y: Pandas Series (n_samples,): Target
         :param cens: Pandas Series (n_samples,): -1 indicates left-censored samples, 0 for uncensored, 1 for right-censored
         :param verbose: boolean, show info from minimization
         :return:
         """
-        x_copy = x.copy()
+        x_copy = X.copy()
         if self.fit_intercept:
             x_copy.insert(0, 'intercept', 1.0)
         else:
-            x_copy.scale(with_mean=True, with_std=False, copy=False)
+            x_copy = x_copy - x_copy.mean()  # Rescale by demeaning in case no intercept is fitted.
         init_reg = LinearRegression(fit_intercept=False).fit(x_copy, y)
         b0 = init_reg.coef_
         y_pred = init_reg.predict(x_copy)
@@ -144,7 +127,7 @@ class TobitModel:
         resid_var = np.var(resid)
         s0 = np.sqrt(resid_var)
         params0 = np.append(b0, s0)
-        xs, ys = split_left_right_censored(x_copy, y, cens)
+        xs, ys = self._split_left_right_censored(x_copy, y)
 
         result = minimize(lambda params: tobit_neg_log_likelihood(xs, ys, params), params0, method='BFGS',
                           jac=lambda params: tobit_neg_log_likelihood_der(xs, ys, params), options={'disp': verbose})
@@ -153,17 +136,43 @@ class TobitModel:
         self.ols_coef_ = b0[1:]
         self.ols_intercept = b0[0]
         if self.fit_intercept:
-            self.intercept_ = result.x[1]
+            self.intercept_ = result.x[0]
             self.coef_ = result.x[1:-1]
         else:
             self.coef_ = result.x[:-1]
             self.intercept_ = 0
         self.sigma_ = result.x[-1]
+        self.params = {'intercept': self.intercept_} if self.fit_intercept else {}
+        self.params.update({var: coef for var, coef in zip(X.columns, self.coef_)})
         return self
 
-    def predict(self, x):
-        return self.intercept_ + np.dot(x, self.coef_)
+    def _define_censoring(self, y):
+        censored = pd.Series(np.zeros((len(y),)))
+        if self.lower_censoring is not None:
+            censored[y == self.lower_censoring] = -1
+        if self.upper_censoring is not None:
+            censored[y == self.upper_censoring] = 1
+        return censored
 
-    def score(self, x, y, scoring_function=mean_absolute_error):
-        y_pred = np.dot(x, self.coef_)
-        return scoring_function(y, y_pred)
+    def _split_left_right_censored(self, x, y):
+        cens = self._define_censoring(y)
+        counts = cens.value_counts()
+        if -1 not in counts and 1 not in counts:
+            warnings.warn("No censored observations; use regression methods for uncensored data")
+        xs = []
+        ys = []
+
+        for value in [-1, 0, 1]:
+            if value in counts:
+                split = cens == value
+                y_split = np.squeeze(y[split].values)
+                x_split = x[split].values
+
+            else:
+                y_split, x_split = None, None
+            xs.append(x_split)
+            ys.append(y_split)
+        return xs, ys
+
+    def predict(self, X):
+        return self.intercept_ + np.dot(X, self.coef_)
